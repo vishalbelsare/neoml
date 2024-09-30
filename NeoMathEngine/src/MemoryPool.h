@@ -16,11 +16,10 @@ limitations under the License.
 #pragma once
 
 #include <MathEngineAllocator.h>
-#include <NeoMathEngine/MemoryHandle.h>
-#include <NeoMathEngine/CrtAllocatedObject.h>
 #include <RawMemoryManager.h>
 #include <unordered_map>
 #include <thread>
+#include <vector>
 
 namespace NeoML {
 

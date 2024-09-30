@@ -98,32 +98,29 @@ using TPtrOwnerReferenceDnnInfo = CPtrOwner<CReferenceDnnInfo, CReferenceDnnInfo
 //------------------------------------------------------------------------------------------------------------
 
 // The link between two layers, connecting one layer output to another layer input
-struct CDnnLayerLink {
+struct CDnnLayerLink final {
 	// the pointer to the linked layer
 	CBaseLayer* Layer;
 	// the number of the output to which the connection leads
-	int OutputNumber;
+	int OutputNumber = -1;
 
 	// Default value for optional inputs.
-	CDnnLayerLink() : Layer( 0 ), OutputNumber( -1 ) {}
-	CDnnLayerLink( const CDnnLayerLink& other ) :
-		Layer( other.Layer ), OutputNumber( other.OutputNumber ) {}
-	CDnnLayerLink( CBaseLayer* layer, int outputNumber ) :
+	CDnnLayerLink() = default;
+	// Be copied and moved by default
+
+	// Converting constructor
+	CDnnLayerLink( CBaseLayer* layer, int outputNumber = 0 ) :
 		Layer( layer ),
 		OutputNumber( outputNumber )
 	{
-		NeoAssert( Layer != 0 );
+		NeoAssert( Layer != nullptr );
 		NeoAssert( OutputNumber >= 0 );
 	}
 
-	// Converting constructor
-	CDnnLayerLink( CBaseLayer* layer ) :
-		Layer( layer ), OutputNumber( 0 ) {}
-
 	// Is this layer optional, i.e. created by CLayerOutout() default constructor.
-	bool IsOptional() const { return Layer == 0 && OutputNumber == -1; }
+	bool IsOptional() const { return Layer == nullptr && OutputNumber == -1; }
 	// Is the layer output valid?
-	bool IsValid() const { return Layer != 0 && OutputNumber >= 0; }
+	bool IsValid() const { return Layer != nullptr && OutputNumber >= 0; }
 };
 
 //------------------------------------------------------------------------------------------------------------
@@ -216,8 +213,8 @@ public:
 	// Releases all temporary resources allocated for the layer
 	virtual void CleanUp( bool totalCleanUp = false );
 
-	// Returns the total size of trainable parameters in this layer
-	// Returns the total size of trainable parameters of its internal layers, if layer is composite or recurrent
+	// Returns the number of trainable parameters (floats or ints) in all of this layer's parameters blobs
+	// Returns the number of trainable parameters of its internal layers, if layer is composite or recurrent
 	virtual size_t GetTrainableParametersSize() const;
 
 	// Enable profile timer for RunOnce
@@ -228,36 +225,6 @@ public:
 	IPerformanceCounters::CCounter::TCounterType GetRunOnceTime() const { return runOnceTime / 1000000; }
 
 protected:
-	// A virtual method that creates output blobs using the input blobs
-	virtual void Reshape() = 0;
-	// A virtual method that implements one step of a forward pass
-	virtual void RunOnce() = 0;
-	// A virtual method that implements one step of a backward pass
-	virtual void BackwardOnce() = 0;
-	// A virtual method that implements one learning step
-	virtual void LearnOnce();
-	// Indicates that learning must be performed for the layer on the current step
-	bool IsLearningPerformed() const;
-	// Indicates that learning must be performed for the layer when Learn method is called
-	bool IsLearningNeeded() const;
-	// Indicates that backpropagation should be performed for the layer on the current step
-	bool IsBackwardPerformed() const;
-	// Indicates that backpropagation must be performed for the layer when Learn method is called
-	bool IsBackwardNeeded() const;
-	// Layer may contain empty paramBlob of given index
-	virtual bool ContainsEmptyParamBlob( int ) const { return false; }
-	// Gets a pointer to the layer connected to the given input
-	CBaseLayer* GetInputLayer(int input) { return inputLinks[input].Layer; }
-	const CBaseLayer* GetInputLayer(int input) const { return inputLinks[input].Layer; }
-	// Checks if the layer has inputs
-	void CheckInputs() const;
-	// Checks if the layer has only one input
-	void CheckInput1() const;
-	// Checks if the layer has outputs
-	void CheckOutputs() const;
-	// Registers the blob with the data needed for learning or backpropagation
-	void RegisterRuntimeBlob(CPtr<CDnnBlob>& blob);
-
 	// Layer input descriptions
 	CArray<CBlobDesc> inputDescs;
 	// Layer output descriptions
@@ -276,6 +243,38 @@ protected:
 	CObjectArray<CDnnBlob> paramBlobs;
 	// The blobs where the parameter diffs are stored
 	CObjectArray<CDnnBlob> paramDiffBlobs;
+
+	// A virtual method that creates output blobs using the input blobs
+	virtual void Reshape() = 0;
+	// A virtual method that implements one step of a forward pass
+	virtual void RunOnce() = 0;
+	// A virtual method that implements one step of a backward pass
+	virtual void BackwardOnce() = 0;
+	// A virtual method that implements one learning step
+	virtual void LearnOnce();
+	// Indicates that learning must be performed for the layer on the current step
+	bool IsLearningPerformed() const;
+	// Indicates that learning must be performed for the layer when Learn method is called
+	bool IsLearningNeeded() const;
+	// Indicates that backpropagation should be performed for the layer on the current step
+	bool IsBackwardPerformed() const;
+	// Indicates that backpropagation must be performed for the layer when Learn method is called
+	bool IsBackwardNeeded() const;
+	// Layer may contain null paramBlob of given index, specialization for transferParamsBlob
+	virtual bool ContainsNullParamBlob( int ) const { return false; }
+	// Special case, specialization for transferParamsBlob
+	virtual bool IsLearnableWithEmptyParamBlobs() const { return false; }
+	// Gets a pointer to the layer connected to the given input
+	CBaseLayer* GetInputLayer(int input) { return inputLinks[input].Layer; }
+	const CBaseLayer* GetInputLayer(int input) const { return inputLinks[input].Layer; }
+	// Checks if the layer has inputs
+	void CheckInputs() const;
+	// Checks if the layer has only one input
+	void CheckInput1() const;
+	// Checks if the layer has outputs
+	void CheckOutputs() const;
+	// Registers the blob with the data needed for learning or backpropagation
+	void RegisterRuntimeBlob(CPtr<CDnnBlob>& blob);
 
 	// Initializes the parameters blob using the specified initializing algorithm
 	// If inputSize == 0, the blob will have the (inputBlobs[input] / 2) size
@@ -324,34 +323,20 @@ private:
 		CString Name; // the name of the layer that is connected to the input
 		int OutputNumber = NotFound; // the number of that layer's output that is connected to the input
 	};
-
-	IMathEngine& mathEngine; 	// the layer's MathEngine
-	CString name;				// the layer name
-	CDnn* dnn;					// the pointer to the current network; may be null if the layer does not belong to a network
-	CArray<CInputInfo> inputs;	// inputs list
-
-	// Indicates if the layer may be trained
-	const bool isLearnable;
-	// Indicates if learning is enabled for the layer
-	bool isLearningEnabled;
-	// The base learning rate (may vary inside the network depending on the learning strategy)
-	float baseLearningRate;
-	// Base regularization multiplier (may vary inside the network depending on the learning strategy)
-	float baseL2RegularizationMult;
-	float baseL1RegularizationMult;
-
-	// Indicates if backpropagation should be performed for the layer
-	enum TBackwardStatus {
+	// Indicates if back propagation should be performed for the layer
+	enum TBackwardStatus : char {
 		BS_Unknown,
 		BS_NeedsBackward,
 		BS_DoesntNeedBackward
 	};
-	TBackwardStatus isBackwardNeeded;
-	// Forces backpropagation
-	bool isBackwardForced;
-	// Forces reshaping the layer even with unchanged inputs
-	// May be useful if you change the parameters that determine the output size
-	bool forcedReshape;
+	// The temporary blob cache for sequence processing in a recurrent layer
+	enum TBlobCacheType {
+		BCT_Input,
+		BCT_Output,
+		BCT_Runtime,
+
+		BCT_Count
+	};
 
 	// Input layer links
 	CArray<CDnnLayerLink> inputLinks;
@@ -359,13 +344,6 @@ private:
 	CArray<int> outputs;
 	// The last layer which uses this outputs
 	CArray<const CBaseLayer*> lastOutputUser;
-
-	// Indicates if the layer should be reshaped
-	bool isReshapeNeeded;
-	// The number of the last network run. As a layer may be called several times 
-	// during RunOnce method execution, it will first check the run number 
-	// and do no calculations if it is still the same run
-	int lastRunNumber;
 
 	// The number of output diffs ready for backpropagation
 	// When the ready diffs and the outputs numbers become the same, the layer is ready for backpropagation
@@ -376,34 +354,60 @@ private:
 	CObjectArray<CDnnBlob> runtimeBlobs;
 	CArray<CPtr<CDnnBlob>*> runtimeBlobPtrs;
 
-	// The temporary blob cache for sequence processing in a recurrent layer
-	enum TBlobCacheType {
-		BCT_Input,
-		BCT_Output,
-		BCT_Runtime,
-
-		BCT_Count
-	};
 	CObjectArray<CDnnBlob> blobCache[BCT_Count];
 
-	// The number of graphs with which the layer is connected
-	int graphCount;
-	// Use timer to calculate run once time and hit count
-	bool useTimer;
-	// The total number of RunOnce calls since last Reshape
-	int runOnceCount;
+	CArray<CInputInfo> inputs; // inputs list
+
+	IMathEngine& mathEngine;   // the layer's MathEngine
+	CString name;              // the layer name
+
+	// Owner network; may be null if the layer does not belong to a network
+	CDnn* dnn = nullptr;
 	// The total time of RunOnce calls since last Reshape in nanoseconds
-	IPerformanceCounters::CCounter::TCounterType runOnceTime;
-	// Indicates if the layer performs in-place processing (after the Reshape method call)
-	bool isInPlace;
+	IPerformanceCounters::CCounter::TCounterType runOnceTime = 0;
+
 	// Fields used for memory optimization during training
 	int allocatedBlobs; // the mask of currently allocated blobs
 	int blobsNeededForBackward; // the mask of blobs needed for backward and learn
+	// The number of the last network run. As a layer may be called several times 
+	// during RunOnce method execution, it will first check the run number 
+	// and do no calculations if it is still the same run
+	int lastRunNumber = 0;
+	// The number of graphs with which the layer is connected
+	int graphCount = 0;
+	// The total number of RunOnce calls since last Reshape
+	int runOnceCount = 0;
+
+	// The base learning rate (may vary inside the network depending on the learning strategy)
+	float baseLearningRate = 1;
+	// Base regularization multiplier (may vary inside the network depending on the learning strategy)
+	float baseL2RegularizationMult = 1;
+	float baseL1RegularizationMult = 1;
+
+	// Indicates if the layer may be trained
+	const bool isLearnable;
+	// Indicates if learning is enabled for the layer
+	bool isLearningEnabled = true;
+	// Indicates if back propagation should be performed for the layer
+	TBackwardStatus isBackwardNeeded = BS_Unknown;
+	// Forces back propagation
+	bool isBackwardForced = false;
+	// Forces reshaping the layer even with unchanged inputs
+	// May be useful if you change the parameters that determine the output size
+	bool forcedReshape = true;
+	// Indicates if the layer should be reshaped
+	bool isReshapeNeeded = true;
+	// Indicates if the layer performs in-place processing (after the Reshape method call)
+	bool isInPlace = false;
+	// Use timer to calculate run once time and hit count
+	bool useTimer = false;
 
 	// Set the 'dist' layer's paramBlobs to point to the data of this layer's paramBlobs
 	void transferParamsBlob(CBaseLayer& dist) const;
 	// Technical method for recursion in GetPath( CArray<CString>& path )
 	void getPath( CArray<CString>& path ) const;
+	void sequentialModeIfRecurrent();
+	void nonSequentialModeIfRecurrent();
 	// Switches the specified blobs into sequence processing mode
 	void switchBlobsToSequentialMode(CObjectArray<CDnnBlob>& blobs, TBlobCacheType cacheType, bool storeParent);
 	void switchBlobsToNonSequentialMode(CObjectArray<CDnnBlob>& blobs, TBlobCacheType cacheType, bool clear);
@@ -604,46 +608,49 @@ public:
 	void EnableProfile( bool profile );
 
 private:
-	const CBaseLayer* owner; // the composite containing this CDnn (if exists)
-	CTextStream* log; // the logging stream
-	int logFrequency; // the logging frequency
-	CPtr<CDnnSolver> solver; // the layer parameter optimizer
+	// The layer map
+	CMap<CString, CBaseLayer*> layerMap;
+	CObjectArray<CBaseLayer> layers;
+	CArray<CBaseLayer*> sinkLayers;
+	CArray<CBaseLayer*> sourceLayers;
 
 	CRandom& random; // the reference to the random numbers generator
 	IMathEngine& mathEngine; // the reference to the math engine
 
-	// The layer map
-	CObjectArray<CBaseLayer> layers;
-	CMap<CString, CBaseLayer*> layerMap;
-	CArray<CBaseLayer*> sinkLayers;
-	CArray<CBaseLayer*> sourceLayers;
-	// The last run number
-	int runNumber;
-	// Indicates if the network needs rebuilding (the configuration has changed)
-	bool isRebuildNeeded;
-	// Indicates that backpropagation and learning should be performed on this step
-	bool isBackwardPerformed;
-	// Indicates that learning is enabled
-	bool isLearningEnabled;
-	// Indicates that the recurrent mode is on (for a sub-network of a recurrent layer)
-	bool isRecurrentMode;
-
+	// The layer parameter optimizer
+	CPtr<CDnnSolver> solver;
 	// The initializer
 	CPtr<CDnnInitializer> initializer;
+	// Reference information
+	TPtrOwnerReferenceDnnInfo referenceDnnInfo;
+
+	const CBaseLayer* owner = nullptr; // the composite containing this CDnn (if exists)
+	CTextStream* log = nullptr; // the logging stream
+
+	// The logging frequency
+	int logFrequency = 100;
+	// The last run number
+	int runNumber = -1;
 
 	//////////////////////////////////////
 	// For sequence processing
-	int maxSequenceLength;
-	int currentSequencePos;
+	int maxSequenceLength = 1;
+	int currentSequencePos = 0;
 	// Indicates that the sequence is processed in reverse order
-	bool isReverseSequense;
+	bool isReverseSequense = false;
 	// The auto-restart mode for each RunOnce/RunAndLearnOnce() call
-	bool autoRestartMode;
-	// The low memory use mode
-	bool isReuseMemoryMode;
+	bool autoRestartMode = true;
 
-	// Reference information
-	TPtrOwnerReferenceDnnInfo referenceDnnInfo;
+	// The low memory use mode
+	bool isReuseMemoryMode = false;
+	// Indicates if the network needs rebuilding (the configuration has changed)
+	bool isRebuildNeeded = false;
+	// Indicates that backpropagation and learning should be performed on this step
+	bool isBackwardPerformed = false;
+	// Indicates that learning is enabled
+	bool isLearningEnabled = true;
+	// Indicates that the recurrent mode is on (for a sub-network of a recurrent layer)
+	bool isRecurrentMode = false;
 
 	// Adds or deletes a layer
 	void AddLayerImpl( CBaseLayer& layer ) override;
