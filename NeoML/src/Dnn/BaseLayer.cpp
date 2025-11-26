@@ -30,22 +30,7 @@ static const size_t MaxMemoryInPools = 192 * 1024 * 1024;
 CBaseLayer::CBaseLayer( IMathEngine& _mathEngine, const char* _name, bool _isLearnable ) :
 	mathEngine( _mathEngine ),
 	name( _name ),
-	dnn( 0 ),
-	isLearnable( _isLearnable ),
-	isLearningEnabled( true ),
-	baseLearningRate( 1 ),
-	baseL2RegularizationMult( 1 ),
-	baseL1RegularizationMult( 1 ),
-	isBackwardNeeded( BS_Unknown ),
-	isBackwardForced( false ),
-	forcedReshape( true ),
-	isReshapeNeeded( true ),
-	lastRunNumber( 0 ),
-	graphCount( 0 ),
-	useTimer( false ),
-	runOnceCount( 0 ),
-	runOnceTime( 0 ),
-	isInPlace( false )
+	isLearnable( _isLearnable )
 {
 }
 
@@ -314,19 +299,50 @@ void CBaseLayer::transferParamsBlob( CBaseLayer& dist ) const
 		}
 	} else {
 		NeoAssertMsg( dist.paramBlobs.Size() == paramBlobs.Size(), "transferParamsBlob: It isn't a copy of the layer" );
+		if( IsLearnableWithEmptyParamBlobs() ) { // Special case is CTiedEmbeddingsLayer
+			NeoAssert( dist.IsLearnable() && paramBlobs.Size() == 0 );
+			return;
+		}
 
 		NeoAssertMsg( !dist.IsLearnable() || paramBlobs.Size() > 0,
 			"transferParamsBlob: The origin dnn should be trained and reshaped to create a reference dnn" );
 		// Create reference copy of dist.paramBlobs with shared buffer
 		// Takes a pointer to parent's blob to access memory
 		for( int j = 0; j < dist.paramBlobs.Size(); ++j ) {
-			if( ContainsEmptyParamBlob( j ) ) {
+			if( ContainsNullParamBlob( j ) ) {
 				dist.paramBlobs[j] = nullptr; // may contain empty parameter
 				continue;
 			}
 			NeoAssertMsg( paramBlobs[j] != nullptr, "transferParamsBlob: All trainable paramBlobs should exist" );
 			dist.paramBlobs[j] = CDnnBlob::CreateWindowBlob( paramBlobs[j], paramBlobs[j]->GetDesc().BatchLength() );
 		}
+	}
+}
+
+void CBaseLayer::sequentialModeIfRecurrent()
+{
+	if( !dnn->IsRecurrentMode() ) {
+		return;
+	}
+	// Switch the input and output blobs to sequential mode (to the current position in sequence)
+	switchBlobsToSequentialMode( inputBlobs, BCT_Input, GetDnn()->isReuseMemoryMode );
+	switchBlobsToSequentialMode( outputBlobs, BCT_Output, GetDnn()->isReuseMemoryMode );
+	switchBlobsToSequentialMode( runtimeBlobs, BCT_Runtime, false );
+	for( int i = 0; i < runtimeBlobs.Size(); i++ ) {
+		*runtimeBlobPtrs[i] = runtimeBlobs[i];
+	}
+}
+
+void CBaseLayer::nonSequentialModeIfRecurrent()
+{
+	if( !dnn->IsRecurrentMode() ) {
+		return;
+	}
+	switchBlobsToNonSequentialMode( inputBlobs, BCT_Input, GetDnn()->isReuseMemoryMode );
+	switchBlobsToNonSequentialMode( outputBlobs, BCT_Output, GetDnn()->isReuseMemoryMode );
+	switchBlobsToNonSequentialMode( runtimeBlobs, BCT_Runtime, false );
+	for( int i = 0; i < runtimeBlobs.Size(); i++ ) {
+		*runtimeBlobPtrs[i] = runtimeBlobs[i];
 	}
 }
 
@@ -389,7 +405,7 @@ void CBaseLayer::reshape()
 	CArray<CBlobDesc> prevInputDescs;
 	inputDescs.MoveTo( prevInputDescs );
 	inputDescs.SetSize(inputs.Size());
-	
+
 	// Call the input layers reshape recursively, reset the input blobs
 	for( int i = 0; i < GetInputCount(); ++i ) {
 		GetInputLayer(i)->reshape();
@@ -404,7 +420,7 @@ void CBaseLayer::reshape()
 
 	if(!forcedReshape) {
 		for(int i = 0; i < inputBlobs.Size(); i++) {
-			forcedReshape = forcedReshape 
+			forcedReshape = forcedReshape
 				|| !inputDescs[i].HasEqualDimensions(prevInputDescs[i]);
 		}
 	}
@@ -513,11 +529,7 @@ void CBaseLayer::runOnce()
 		inputBlobs[i] = prevLayerOutput;
 	}
 
-	const bool mayFreeIoBlobs = GetDnn()->isReuseMemoryMode
-		&& ( !GetDnn()->isBackwardPerformed || !GetDnn()->IsRecurrentMode() || GetDnn()->IsLastSequencePos()
-			|| ( ( blobsNeededForBackward & TInputBlobs ) == 0 && ( !isInPlace || ( blobsNeededForBackward & TOutputBlobs ) == 0 ) ) );
-
-	if( mayFreeIoBlobs ) {
+	if( mayFreeIoBlobs() ) {
 		for( int i = 0; i < inputBlobs.Size(); ++i ) {
 			CBaseLayer* inputLayer = GetInputLayer( i );
 			const int outputNumber = inputs[i].OutputNumber;
@@ -534,32 +546,51 @@ void CBaseLayer::runOnce()
 	allocatedBlobs = TInputBlobs | TOutputBlobs;
 
 	// Create window blobs for the inputs and outputs
-	if( dnn->IsRecurrentMode() ) {
-		switchBlobsToSequentialMode(inputBlobs, BCT_Input, GetDnn()->isReuseMemoryMode );
-		switchBlobsToSequentialMode(outputBlobs, BCT_Output, GetDnn()->isReuseMemoryMode );
-		switchBlobsToSequentialMode(runtimeBlobs, BCT_Runtime, false);
-		for(int i = 0; i < runtimeBlobs.Size(); i++) {
-			*runtimeBlobPtrs[i] = runtimeBlobs[i];
-		}
-	}
+	sequentialModeIfRecurrent();
 
 	{
 		CRunOnceTimer timer( useTimer, MathEngine(), runOnceCount, runOnceTime );
 		RunOnce();
 	}
 
-	if( dnn->IsRecurrentMode() ) {
-		switchBlobsToNonSequentialMode(inputBlobs, BCT_Input, GetDnn()->isReuseMemoryMode );
-		switchBlobsToNonSequentialMode(outputBlobs, BCT_Output, GetDnn()->isReuseMemoryMode );
-		switchBlobsToNonSequentialMode(runtimeBlobs, BCT_Runtime, false);
-		for(int i = 0; i < runtimeBlobs.Size(); i++) {
-			*runtimeBlobPtrs[i] = runtimeBlobs[i];
-		}
-	}
+	nonSequentialModeIfRecurrent();
 
 	if( GetDnn()->isReuseMemoryMode ) {
 		setAllocatedBlobs( TOutputBlobs | blobsNeededForBackward );
 	}
+}
+
+// Checks if output blobs of input layers can be discarded.
+bool CBaseLayer::mayFreeIoBlobs() const
+{
+	assert( dnn != nullptr );
+
+	if( !dnn->isReuseMemoryMode ) {
+		// Memory reuse turned off.
+		return false;
+	}
+
+	if( dnn->IsRecurrentMode() && !dnn->IsLastSequencePos() ) {
+		// Recurrent layer processing is incomplete.
+		return false;
+	}
+
+	if( !dnn->isBackwardPerformed ) {
+		// Inference mode, intermediate data is not required.
+		return true;
+	}
+
+	if( (blobsNeededForBackward & TInputBlobs) != 0 ) {
+		// Input blobs are required for back propagation.
+		return false;
+	}
+
+	if( isInPlace && (blobsNeededForBackward & TOutputBlobs) != 0 ) {
+		// Output blobs are required for back propagation and they are the same as input.
+		return false;
+	}
+
+	return true;
 }
 
 // Recalculates the isBackwardNeeded flag; recursively checks the inputs
@@ -604,16 +635,8 @@ void CBaseLayer::backwardRunAndLearnOnce()
 			return; // not enough diff blobs for the output
 		}
 	}
-
-	if( dnn->IsRecurrentMode() ) {
-		// Switch the input and output blobs to sequential mode (to the current position in sequence)
-		switchBlobsToSequentialMode(inputBlobs, BCT_Input, GetDnn()->isReuseMemoryMode);
-		switchBlobsToSequentialMode(outputBlobs, BCT_Output, GetDnn()->isReuseMemoryMode);
-		switchBlobsToSequentialMode(runtimeBlobs, BCT_Runtime, false);
-		for(int i = 0; i < runtimeBlobs.Size(); i++) {
-			*runtimeBlobPtrs[i] = runtimeBlobs[i];
-		}
-	}
+	
+	sequentialModeIfRecurrent();
 
 	// Start backward run and learning
 	if( IsBackwardPerformed() ) {
@@ -631,7 +654,7 @@ void CBaseLayer::backwardRunAndLearnOnce()
 			}
 		}
 
-		// Perform one step of error backward propagation: 
+		// Perform one step of error backward propagation:
 		// calculate the input error from the output one
 		BackwardOnce();
 	}
@@ -653,7 +676,7 @@ void CBaseLayer::backwardRunAndLearnOnce()
 			paramDiffBlobs.DeleteAll();
 		}
 	}
-	
+
 	outputDiffBlobs.DeleteAll();
 
 	if( IsBackwardPerformed() ) {
@@ -674,14 +697,8 @@ void CBaseLayer::backwardRunAndLearnOnce()
 	for( int out = 0; out < readyOutputDiffs.Size(); ++out ) {
 		readyOutputDiffs[out] = 0;
 	}
-	if( dnn->IsRecurrentMode() ) {
-		switchBlobsToNonSequentialMode(inputBlobs, BCT_Input, GetDnn()->isReuseMemoryMode);
-		switchBlobsToNonSequentialMode(outputBlobs, BCT_Output, GetDnn()->isReuseMemoryMode);
-		switchBlobsToNonSequentialMode(runtimeBlobs, BCT_Runtime, false);
-		for(int i = 0; i < runtimeBlobs.Size(); i++) {
-			*runtimeBlobPtrs[i] = runtimeBlobs[i];
-		}
-	}
+
+	nonSequentialModeIfRecurrent();
 
 	// If layer needs its inputs or outputs for training
 	// then it needs them for all the steps of the recurrent part
@@ -693,7 +710,7 @@ void CBaseLayer::backwardRunAndLearnOnce()
 }
 
 // Handles the notification that output diff is ready for a given output
-// If that is the last output diff necessary for learning, 
+// If that is the last output diff necessary for learning,
 // backpropagation and learning are started for this layer
 void CBaseLayer::transferDiffBlob( CDnnBlob* diffBlob, int outputNum )
 {
@@ -786,49 +803,38 @@ void CBaseLayer::InitializeParamBlob(int input, CDnnBlob& blob, int inputCount)
 	GetDnn()->GetInitializer()->InitializeLayerParams(blob, inputCount);
 }
 
-static const int BaseLayerVersion = 2000;
+static constexpr int baseLayerVersion = 2000;
 
 void CBaseLayer::Serialize( CArchive& archive )
 {
-	archive.SerializeVersion(BaseLayerVersion, CDnn::ArchiveMinSupportedVersion);
-	if( archive.IsStoring() ) {
-		archive << name;
-		archive << inputs.Size();
-		for(int i = 0; i < inputs.Size(); ++i) {
-			archive << inputs[i].Name;
-			archive << inputs[i].OutputNumber;
-		}
-		archive << isBackwardForced;
-		archive << isLearningEnabled;
-		archive << baseLearningRate << baseL2RegularizationMult << baseL1RegularizationMult;
+	archive.SerializeVersion( baseLayerVersion, CDnn::ArchiveMinSupportedVersion );
 
-		const bool nonReferenceDnnLayer = ( GetDnn() == nullptr || !GetDnn()->IsReferenceDnn() );
-		if( nonReferenceDnnLayer ) {
-			SerializeBlobs( mathEngine, archive, paramBlobs );
-		} else { // Reference dnns will point to original dnn paramBlobs
-			CObjectArray<CDnnBlob> emptyParamBlobs;
-			emptyParamBlobs.SetSize( paramBlobs.Size() );
-			SerializeBlobs( mathEngine, archive, emptyParamBlobs );
-		}
-	} else if( archive.IsLoading() ) {
-		if( dnn != 0 ) {
-			unlink();
-		}
-		archive >> name;
-		int inputCount;
-		archive >> inputCount;
-		inputs.SetSize( inputCount );
-		for(int i = 0; i < inputCount; ++i) {
-			archive >> inputs[i].Name;
-			archive >> inputs[i].OutputNumber;
-		}
-		archive >> isBackwardForced;
-		archive >> isLearningEnabled;
-		archive >> baseLearningRate >> baseL2RegularizationMult >> baseL1RegularizationMult;
+	if( archive.IsLoading() && dnn != nullptr ) {
+		unlink();
+	}
+	archive.Serialize( name );
 
+	int inputsSize = inputs.Size();
+	archive.Serialize( inputsSize );
+	inputs.SetSize( inputsSize );
+	for( int i = 0; i < inputs.Size(); ++i ) {
+		archive.Serialize( inputs[i].Name );
+		archive.Serialize( inputs[i].OutputNumber );
+	}
+
+	archive.Serialize( isBackwardForced );
+	archive.Serialize( isLearningEnabled );
+	archive.Serialize( baseLearningRate );
+	archive.Serialize( baseL2RegularizationMult );
+	archive.Serialize( baseL1RegularizationMult );
+
+	const bool nonReferenceDnnLayer = ( archive.IsLoading() || GetDnn() == nullptr || !GetDnn()->IsReferenceDnn() );
+	if( nonReferenceDnnLayer ) {
 		SerializeBlobs( mathEngine, archive, paramBlobs );
-	} else {
-		NeoAssert( false );
+	} else { // Reference dnns will point to original dnn paramBlobs
+		CObjectArray<CDnnBlob> emptyParamBlobs;
+		emptyParamBlobs.SetSize( paramBlobs.Size() );
+		SerializeBlobs( mathEngine, archive, emptyParamBlobs );
 	}
 }
 
